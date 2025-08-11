@@ -127,20 +127,66 @@ const IFRSAdvisor: React.FC = () => {
     setSentInOrder(null);
     setSessionLoading(true);
 
-    const socket = new WebSocket("wss://104.248.169.227:8443/ws/rag/");
+    const WS_URL = "wss://104.248.169.227:8443/ws/rag/";
+
+    // Verbose diagnostics
+    console.groupCollapsed("[IFRS WS] New session");
+    console.info("[IFRS WS] Preparing to connect", {
+      WS_URL,
+      timestamp: new Date().toISOString(),
+      pageProtocol: window.location.protocol,
+      secureContext: (window as any).isSecureContext,
+      backgroundLength: background.length,
+      questionCount: trimmedQuestions.length,
+    });
+
+    let connectTimeout: number | undefined;
+    const socket = new WebSocket(WS_URL);
     setWs(socket);
 
+    console.info("[IFRS WS] Connecting… readyState:", socket.readyState);
+
+    // Timeout if connection hangs
+    connectTimeout = window.setTimeout(() => {
+      if (socket.readyState === WebSocket.CONNECTING) {
+        console.error("[IFRS WS] Connection timeout after 10s");
+        try { socket.close(); } catch {}
+        setSessionLoading(false);
+        toast({
+          title: "Connection timeout",
+          description: "Could not establish a secure WebSocket within 10s. Check TLS/cert or server availability.",
+        });
+        console.groupEnd();
+      }
+    }, 10000);
+
     socket.onopen = () => {
+      if (connectTimeout) clearTimeout(connectTimeout);
+      console.info("[IFRS WS] Connected (onopen). readyState:", socket.readyState);
       const payload = {
         type: "process_questions",
         background: background.trim(),
         questions: trimmedQuestions,
         model: "gpt-4o-mini",
       };
-      socket.send(JSON.stringify(payload));
+      try {
+        console.debug("[IFRS WS] Sending payload:", {
+          ...payload,
+          // Avoid logging entire background/questions content if too long
+          backgroundPreview: payload.background.slice(0, 120),
+          questionsPreview: payload.questions.map((q) => q.slice(0, 80)),
+        });
+        socket.send(JSON.stringify(payload));
+        console.info("[IFRS WS] Payload sent successfully");
+      } catch (err) {
+        console.error("[IFRS WS] Failed to send payload", err);
+        setSessionLoading(false);
+        toast({ title: "Send failed", description: "Payload could not be sent. See console for details." });
+      }
     };
 
     socket.onmessage = (event) => {
+      console.debug("[IFRS WS] onmessage raw:", event.data);
       try {
         const data: IncomingMessage = JSON.parse(event.data);
         if (typeof (data as any).sent_in_order === "boolean") {
@@ -148,25 +194,52 @@ const IFRSAdvisor: React.FC = () => {
         }
         if ((data as any).type === "answer") {
           const msg = data as AnswerMessage;
+          console.debug("[IFRS WS] Answer received", msg);
           setAnswers((prev) => ({ ...prev, [msg.question_number]: msg }));
           setTyping((t) => ({ ...t, [msg.question_number]: false }));
         } else if ((data as any).type === "summary") {
           const msg = data as SummaryMessage;
+          console.debug("[IFRS WS] Summary received", msg);
           setSummary(msg);
           setSessionLoading(false);
+          console.groupEnd();
+        } else {
+          console.warn("[IFRS WS] Unknown message type", data);
         }
       } catch (e) {
-        console.error("Failed to parse message", e);
+        console.error("[IFRS WS] Failed to parse message", e, {
+          sample: typeof event.data === "string" ? event.data.slice(0, 200) : event.data,
+        });
       }
     };
 
-    socket.onerror = () => {
+    socket.onerror = (ev) => {
+      if (connectTimeout) clearTimeout(connectTimeout);
+      console.error("[IFRS WS] onerror fired", ev, { readyState: socket.readyState, url: WS_URL });
       setSessionLoading(false);
-      toast({ title: "Connection error", description: "Could not connect to IFRS Advisor. Please try again.", });
+      toast({
+        title: "Connection error",
+        description: "WebSocket error occurred. Common causes: TLS certificate mismatch (IP vs domain), firewall, or server down.",
+      });
+      // Keep group open; onclose may follow
     };
 
-    socket.onclose = () => {
+    socket.onclose = (ev: CloseEvent) => {
+      if (connectTimeout) clearTimeout(connectTimeout);
+      console.warn("[IFRS WS] onclose", {
+        code: ev.code,
+        reason: ev.reason,
+        wasClean: ev.wasClean,
+        readyState: socket.readyState,
+      });
       setSessionLoading(false);
+      if (ev.code !== 1000) {
+        toast({
+          title: `Connection closed (${ev.code})`,
+          description: ev.reason || "The connection was closed unexpectedly. See console for diagnostics.",
+        });
+      }
+      console.groupEnd();
     };
   };
 
